@@ -31,7 +31,11 @@ def test_parse_list_page_extracts_announcements():
     assert seoul.detail_url.endswith("panId=2024-001&panDtlSeq=1")
 
     gyeonggi = announcements[1]
-    assert gyeonggi.request_payload == {"panId": "2024-002", "panDtlSeq": "2"}
+    assert gyeonggi.request_payload
+    assert gyeonggi.request_payload["panId"] == "2024-002"
+    assert gyeonggi.request_payload["panDtlSeq"] == "2"
+    assert gyeonggi.request_payload["notiSeq"] == "10"
+    assert gyeonggi.request_payload["bbsSeq"] == "5"
 
 
 @responses.activate
@@ -50,8 +54,13 @@ def test_fetch_attachments_filters_pdf_only():
 
     attachments = crawler.fetch_attachments(announcement)
 
-    assert [a.name for a in attachments] == ["공고문", "안내문"]
-    assert all(a.url.lower().endswith(".pdf") for a in attachments)
+    assert len(attachments) == 3
+    assert attachments[0].name == "공고문.pdf"
+    assert attachments[0].url.endswith("lfhFile.do?fileId=abc123")
+    assert attachments[1].name == "안내문.PDF"
+    assert attachments[1].url.endswith("common/fileDownload.do?fileKey=xyz987")
+    assert attachments[2].name == "brochure.PDF"
+    assert attachments[2].url.endswith("filename=brochure.PDF")
 
 
 @responses.activate
@@ -75,17 +84,23 @@ def test_crawl_downloads_attachments(tmp_path):
         status=200,
     )
 
-    base_download = "https://apply.lh.or.kr/file/download"
     responses.add(
         responses.GET,
-        f"{base_download}?uuid=abc123&filename=notice.pdf",
+        "https://apply.lh.or.kr/lhapply/lfhFile.do?fileId=abc123",
         body=b"%PDF-1.4",
         status=200,
         content_type="application/pdf",
     )
     responses.add(
         responses.GET,
-        f"{base_download}?uuid=xyz987&filename=guide.PDF",
+        "https://apply.lh.or.kr/common/fileDownload.do?fileKey=xyz987",
+        body=b"%PDF-1.4",
+        status=200,
+        content_type="application/pdf",
+    )
+    responses.add(
+        responses.GET,
+        "https://apply.lh.or.kr/file/download?uuid=qwe555&filename=brochure.PDF",
         body=b"%PDF-1.4",
         status=200,
         content_type="application/pdf",
@@ -98,8 +113,8 @@ def test_crawl_downloads_attachments(tmp_path):
 
     seoul_dir = tmp_path / announcements[0].slug()
     assert seoul_dir.exists()
-    downloaded = list(seoul_dir.glob("*.pdf"))
-    assert len(downloaded) == 2
+    downloaded = list(seoul_dir.iterdir())
+    assert len(downloaded) == 3
 
     metadata_dump = tmp_path / "metadata.json"
     metadata_dump.write_text(json.dumps({"count": len(announcements)}), encoding="utf-8")

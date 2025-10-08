@@ -5,10 +5,24 @@
   <title>상세</title>
 </head>
 <body>
+  <script>
+    function fileDownLoad(fileId) {
+      if (!fileId) {
+        alert('파일이 없습니다.');
+        return;
+      }
+      location.href = "/lhapply/lfhFile.do?fileId=" + fileId;
+    }
+
+    function mfn_fileDownload(fileKey) {
+      location.href = "/common/fileDownload.do?fileKey=" + fileKey;
+    }
+  </script>
   <section class="attachments">
-    <a href="/file/download?uuid=abc123&filename=notice.pdf">공고문</a>
-    <a href="/file/download?uuid=xyz987&filename=guide.PDF">안내문</a>
-    <a href="/file/download?uuid=qwe555&filename=plan.hwp">계획서</a>
+    <a href="javascript:fileDownLoad('abc123');">공고문.pdf</a>
+    <a href="javascript:mfn_fileDownload('xyz987');">안내문.PDF</a>
+    <a href="javascript:fileDownLoad('zzz999');">모집요강.hwp</a>
+    <a href="/file/download?uuid=qwe555&filename=brochure.PDF">브로슈어</a>
   </section>
 </body>
 </html>

@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "public-housing"
+version = "0.1.0"
+description = ""
+authors = ["Seungyeon Kim <syk.kairos@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+requests = "^2.32.5"
+responses = "^0.25.8"
+pytest = "^8.4.2"
+beautifulsoup4 = "^4.14.2"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

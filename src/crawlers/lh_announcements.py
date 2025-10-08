@@ -175,17 +175,12 @@ class LHAnnouncementCrawler:
         soup = BeautifulSoup(detail_html, "html.parser")
         attachments: List[Attachment] = []
 
-        for anchor in soup.select("a[href]"):
-            href = anchor["href"]
-            if not href.lower().endswith(".pdf"):
-                continue
-            attachment_url = urljoin(self.detail_url, href)
-            attachments.append(
-                Attachment(
-                    name=anchor.get_text(strip=True) or Path(attachment_url).name,
-                    url=attachment_url,
-                )
-            )
+        download_endpoints = self._scrape_download_endpoints(soup)
+
+        for anchor in soup.select("a"):
+            attachment = self._parse_attachment_anchor(anchor, download_endpoints)
+            if attachment:
+                attachments.append(attachment)
 
         return attachments
 
@@ -241,21 +236,167 @@ class LHAnnouncementCrawler:
         return cleaned or "attachment.pdf"
 
     def _resolve_detail_target(self, link) -> tuple[Optional[str], Optional[Dict[str, str]]]:
-        href = link.get("href", "")
+        href = link.get("href", "") or ""
         if href and not href.startswith("javascript:"):
             return urljoin(self.list_url, href), None
 
-        js_target = href or ""
-        match = re.search(r"fn[_a-zA-Z]*\(([^)]+)\)", js_target)
+        js_sources = [href, link.get("onclick", "") or ""]
+        for source in js_sources:
+            payload = self._parse_js_payload(source)
+            if payload:
+                return None, payload
+
+        payload = self._parse_data_attributes(link)
+        if payload:
+            return None, payload
+
+        return None, None
+
+    def _parse_js_payload(self, text: str) -> Optional[Dict[str, str]]:
+        if not text:
+            return None
+
+        match = re.search(r"fn[_a-zA-Z0-9]*\(([^)]*)\)", text)
         if not match:
-            return None, None
+            return None
 
         raw_args = match.group(1)
-        args = [arg.strip("' ") for arg in raw_args.split(",")]
+        args = [arg.strip().strip("'\"") for arg in raw_args.split(",")]
         payload_keys = ["panId", "panDtlSeq", "notiSeq", "bbsSeq"]
-        payload = {key: value for key, value in zip(payload_keys, args)}
-        payload = {k: v for k, v in payload.items() if v}
-        return None, payload or None
+        payload = {key: value for key, value in zip(payload_keys, args) if value}
+        return payload or None
+
+    def _parse_data_attributes(self, link) -> Optional[Dict[str, str]]:
+        attribute_map = {
+            "panId": ["data-panid", "data-pan-id", "data-id1"],
+            "panDtlSeq": ["data-pandtlseq", "data-pan-dtl-seq", "data-id2"],
+            "notiSeq": ["data-notiseq", "data-noti-seq", "data-id3"],
+            "bbsSeq": ["data-bbsseq", "data-bbs-seq", "data-id4"],
+        }
+
+        payload: Dict[str, str] = {}
+        for key, candidates in attribute_map.items():
+            for candidate in candidates:
+                value = link.get(candidate)
+                if value:
+                    payload[key] = value.strip()
+                    break
+
+        return payload or None
+
+    def _parse_attachment_anchor(self, anchor, endpoints: Dict[str, str]) -> Optional[Attachment]:
+        href = anchor.get("href") or ""
+        onclick = anchor.get("onclick") or ""
+
+        name = self._extract_anchor_name(anchor)
+
+        if href:
+            attachment_url = urljoin(self.detail_url, href)
+            if href.lower().endswith(".pdf") or self._looks_like_pdf(name, attachment_url):
+                adjusted_name = self._ensure_pdf_extension(name, attachment_url)
+                return Attachment(name=adjusted_name, url=attachment_url)
+
+        for source in (href, onclick):
+            download_url = self._extract_js_download(source, endpoints)
+            if not download_url:
+                continue
+            if not self._looks_like_pdf(name, download_url):
+                continue
+            adjusted_name = self._ensure_pdf_extension(name, download_url)
+            return Attachment(name=adjusted_name, url=download_url)
+
+        return None
+
+    def _extract_js_download(self, source: str, endpoints: Dict[str, str]) -> Optional[str]:
+        if not source or "filedown" not in source.lower():
+            return None
+
+        match = re.search(r"([a-zA-Z_][\w]*)\s*\(([^)]*)\)", source)
+        if not match:
+            return None
+
+        function_name = match.group(1)
+        raw_arguments = match.group(2)
+        args = [arg.strip().strip("'\"") for arg in raw_arguments.split(",") if arg.strip()]
+
+        return self._build_download_url(function_name, args, endpoints)
+
+    def _build_download_url(
+        self, function_name: str, args: List[str], endpoints: Dict[str, str]
+    ) -> Optional[str]:
+        key = function_name.lower()
+        if not args:
+            return None
+
+        if key == "mfn_filedownload":
+            base = endpoints.get(key, "/common/fileDownload.do?fileKey=")
+        elif key.startswith("filedownload"):
+            # Normalise camelCase "fileDownLoad" variations.
+            base = endpoints.get(key, "/lhapply/lfhFile.do?fileId=")
+        else:
+            return None
+
+        base = base.strip()
+
+        return urljoin(self.detail_url, f"{base}{args[0]}")
+
+    @staticmethod
+    def _extract_anchor_name(anchor) -> str:
+        text = anchor.get_text(" ", strip=True)
+        if text:
+            return text
+        for attribute in ("title", "data-file-name", "data-filename"):
+            value = anchor.get(attribute)
+            if value:
+                return value
+        return ""
+
+    @staticmethod
+    def _looks_like_pdf(*candidates: str) -> bool:
+        for candidate in candidates:
+            if candidate and ".pdf" in candidate.lower():
+                return True
+        return False
+
+    def _ensure_pdf_extension(self, name: str, fallback_url: str) -> str:
+        if name and name.lower().endswith(".pdf"):
+            return name
+
+        url_name = Path(fallback_url).name
+        if url_name.lower().endswith(".pdf"):
+            return url_name
+
+        if name:
+            return f"{name}.pdf"
+
+        return "attachment.pdf"
+
+    def _scrape_download_endpoints(self, soup: BeautifulSoup) -> Dict[str, str]:
+        script_text = "\n".join(script.get_text() or "" for script in soup.find_all("script"))
+        endpoints: Dict[str, str] = {}
+
+        function_names = [
+            "fileDownLoad",
+            "fileDownLoad2",
+            "fileDownLoad3",
+            "fileDownLoad4",
+            "fileDownload",
+            "fileDownload2",
+            "fileDownload3",
+            "fileDownload4",
+            "mfn_fileDownload",
+        ]
+
+        for func in function_names:
+            pattern = re.compile(
+                rf"function\s+{func}\s*\([^)]*\)\s*{{.*?location\\.href\s*=\s*['\"]([^'\"]+)['\"]",
+                re.IGNORECASE | re.DOTALL,
+            )
+            match = pattern.search(script_text)
+            if match:
+                endpoints[func.lower()] = match.group(1)
+
+        return endpoints
 
     def _detect_has_next_page(self, soup: BeautifulSoup) -> bool:
         pagination_candidates = soup.select("ul.pagination li") or soup.select("div.pagination a")
