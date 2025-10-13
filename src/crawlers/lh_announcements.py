@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 LOGGER = logging.getLogger(__name__)
 
 LIST_URL = "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancList.do?mi=1026"
-DETAIL_URL = "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancDetail.do"
+DETAIL_URL = "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancInfo.do"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -75,6 +75,11 @@ class LHAnnouncementCrawler:
     def _build_session(self) -> requests.Session:
         session = requests.Session()
         session.headers.update({"User-Agent": DEFAULT_USER_AGENT})
+        # Visit list page to establish session cookies
+        try:
+            session.get(self.list_url, timeout=10)
+        except Exception as e:
+            LOGGER.warning("Failed to initialize session: %s", e)
         return session
 
     def crawl(self) -> List[Announcement]:
@@ -190,7 +195,7 @@ class LHAnnouncementCrawler:
         if announcement.detail_url:
             response = self.session.get(announcement.detail_url, timeout=30)
         elif announcement.request_payload:
-            response = self.session.post(self.detail_url, data=announcement.request_payload, timeout=30)
+            response = self.session.get(self.detail_url, params=announcement.request_payload, timeout=30)
         else:
             LOGGER.warning("Announcement %s lacks detail information", announcement.identifier)
             return None
@@ -269,9 +274,9 @@ class LHAnnouncementCrawler:
     def _parse_data_attributes(self, link) -> Optional[Dict[str, str]]:
         attribute_map = {
             "panId": ["data-panid", "data-pan-id", "data-id1"],
-            "panDtlSeq": ["data-pandtlseq", "data-pan-dtl-seq", "data-id2"],
-            "notiSeq": ["data-notiseq", "data-noti-seq", "data-id3"],
-            "bbsSeq": ["data-bbsseq", "data-bbs-seq", "data-id4"],
+            "ccrCnntSysDsCd": ["data-ccrcnntsysdscd", "data-ccr-cnnt-sys-ds-cd", "data-id2"],
+            "uppAisTpCd": ["data-uppaistpcd", "data-upp-ais-tp-cd", "data-id3"],
+            "aisTpCd": ["data-aistpcd", "data-ais-tp-cd", "data-id4"],
         }
 
         payload: Dict[str, str] = {}
@@ -290,20 +295,32 @@ class LHAnnouncementCrawler:
 
         name = self._extract_anchor_name(anchor)
 
-        if href:
+        # Direct non-JS link
+        if href and not href.lower().startswith("javascript:"):
             attachment_url = urljoin(self.detail_url, href)
             if href.lower().endswith(".pdf") or self._looks_like_pdf(name, attachment_url):
                 adjusted_name = self._ensure_pdf_extension(name, attachment_url)
                 return Attachment(name=adjusted_name, url=attachment_url)
 
+        # Handle javascript:fileDownLoad('fileId') pattern
         for source in (href, onclick):
+            if not source:
+                continue
+
+            # Pattern: fileDownLoad('63845238')
+            match = re.search(r"fileDownLoad\(['\"](\w+)['\"]\)", source, re.IGNORECASE)
+            if match:
+                file_id = match.group(1)
+                download_url = f"https://apply.lh.or.kr/lhapply/lhFile.do?fileid={file_id}"
+                if self._looks_like_pdf(name, download_url):
+                    adjusted_name = self._ensure_pdf_extension(name, download_url)
+                    return Attachment(name=adjusted_name, url=download_url)
+
+            # Fallback: try existing endpoint extraction logic
             download_url = self._extract_js_download(source, endpoints)
-            if not download_url:
-                continue
-            if not self._looks_like_pdf(name, download_url):
-                continue
-            adjusted_name = self._ensure_pdf_extension(name, download_url)
-            return Attachment(name=adjusted_name, url=download_url)
+            if download_url and self._looks_like_pdf(name, download_url):
+                adjusted_name = self._ensure_pdf_extension(name, download_url)
+                return Attachment(name=adjusted_name, url=download_url)
 
         return None
 
