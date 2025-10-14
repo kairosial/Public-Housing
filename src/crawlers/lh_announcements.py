@@ -129,7 +129,10 @@ class LHAnnouncementCrawler:
     def fetch_list_page(self, page_index: int) -> str:
         """Retrieve the raw HTML for a list page."""
 
-        payload = {"pageIndex": page_index}
+        # LH accepts GET with currPage query parameter
+        payload = {
+            "currPage": page_index,
+        }
         response = self.session.get(self.list_url, params=payload, timeout=30)
         response.raise_for_status()
         self._ensure_encoding(response)
@@ -302,13 +305,13 @@ class LHAnnouncementCrawler:
                 adjusted_name = self._ensure_pdf_extension(name, attachment_url)
                 return Attachment(name=adjusted_name, url=attachment_url)
 
-        # Handle javascript:fileDownLoad('fileId') pattern
+        # Handle javascript:fileDownLoad('fileId') pattern (but not mfn_fileDownload)
         for source in (href, onclick):
             if not source:
                 continue
 
-            # Pattern: fileDownLoad('63845238')
-            match = re.search(r"fileDownLoad\(['\"](\w+)['\"]\)", source, re.IGNORECASE)
+            # Pattern: fileDownLoad('63845238') - use word boundary to avoid matching mfn_fileDownload
+            match = re.search(r"\bfileDownLoad\(['\"](\w+)['\"]\)", source, re.IGNORECASE)
             if match:
                 file_id = match.group(1)
                 download_url = f"https://apply.lh.or.kr/lhapply/lhFile.do?fileid={file_id}"
@@ -316,7 +319,7 @@ class LHAnnouncementCrawler:
                     adjusted_name = self._ensure_pdf_extension(name, download_url)
                     return Attachment(name=adjusted_name, url=download_url)
 
-            # Fallback: try existing endpoint extraction logic
+            # Fallback: try existing endpoint extraction logic for mfn_fileDownload and others
             download_url = self._extract_js_download(source, endpoints)
             if download_url and self._looks_like_pdf(name, download_url):
                 adjusted_name = self._ensure_pdf_extension(name, download_url)
@@ -379,9 +382,20 @@ class LHAnnouncementCrawler:
         if name and name.lower().endswith(".pdf"):
             return name
 
-        url_name = Path(fallback_url).name
-        if url_name.lower().endswith(".pdf"):
-            return url_name
+        # Try to extract filename from URL query parameters (e.g., ?filename=foo.pdf)
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(fallback_url)
+        if parsed.query:
+            params = parse_qs(parsed.query)
+            if "filename" in params and params["filename"]:
+                url_name = params["filename"][0]
+                if url_name.lower().endswith(".pdf"):
+                    return url_name
+
+        # Fallback to extracting from URL path
+        url_path_name = Path(parsed.path if hasattr(parsed, "path") else fallback_url).name
+        if url_path_name.lower().endswith(".pdf"):
+            return url_path_name
 
         if name:
             return f"{name}.pdf"
@@ -416,9 +430,35 @@ class LHAnnouncementCrawler:
         return endpoints
 
     def _detect_has_next_page(self, soup: BeautifulSoup) -> bool:
-        pagination_candidates = soup.select("ul.pagination li") or soup.select("div.pagination a")
+        # Find pagination container (actual LH site uses div.bbs_pagerA)
+        pager = soup.select_one("div.bbs_pagerA") or soup.select_one("ul.pagination") or soup.select_one("div.pagination")
+        if not pager:
+            return False
+
+        # Extract current page number from <strong class="bbs_pge_num" title="현재페이지">
+        current_page_element = pager.select_one("strong.bbs_pge_num[title*='현재']")
+        if current_page_element:
+            try:
+                current_page = int(current_page_element.get_text(strip=True))
+            except ValueError:
+                current_page = 1
+        else:
+            current_page = 1
+
+        # Check if there are page number links with higher page numbers
+        page_links = pager.select("a.bbs_pge_num")
+        for link in page_links:
+            onclick = link.get("onclick", "")
+            # Pattern: goPaging(2) or goPaging(3), etc.
+            match = re.search(r"goPaging\((\d+)\)", onclick)
+            if match:
+                page_num = int(match.group(1))
+                if page_num > current_page:
+                    return True
+
+        # Fallback: check for "다음" (next) or ">" links that aren't disabled
         keywords = {"next", "다음", ">"}
-        for element in pagination_candidates:
+        for element in pager.select("li, a"):
             label = element.get_text(strip=True).lower()
             if not any(keyword in label for keyword in keywords):
                 continue
@@ -432,7 +472,7 @@ class LHAnnouncementCrawler:
             elif getattr(element, "name", "") == "a":
                 if element.get("class") and "disabled" in element.get("class"):
                     continue
-                return bool(element.get("href"))
+                return bool(element.get("href") or element.get("onclick"))
 
         return False
 

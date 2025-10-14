@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 import responses
+from responses import matchers
 
 from src.crawlers.lh_announcements import (
     Announcement,
@@ -43,6 +44,10 @@ def test_fetch_attachments_filters_pdf_only():
     detail_html = load_fixture("lh_detail_page.html")
     detail_url = "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancDetail.do?panId=2024-001&panDtlSeq=1"
 
+    # Mock list page GET for session initialization
+    list_url = "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancList.do?mi=1026"
+    responses.add(responses.GET, list_url, body="<html></html>", status=200)
+
     responses.add(responses.GET, detail_url, body=detail_html, status=200)
 
     crawler = LHAnnouncementCrawler()
@@ -56,7 +61,7 @@ def test_fetch_attachments_filters_pdf_only():
 
     assert len(attachments) == 3
     assert attachments[0].name == "공고문.pdf"
-    assert attachments[0].url.endswith("lfhFile.do?fileId=abc123")
+    assert attachments[0].url.endswith("lhFile.do?fileid=abc123")
     assert attachments[1].name == "안내문.PDF"
     assert attachments[1].url.endswith("common/fileDownload.do?fileKey=xyz987")
     assert attachments[2].name == "brochure.PDF"
@@ -66,27 +71,54 @@ def test_fetch_attachments_filters_pdf_only():
 @responses.activate
 def test_crawl_downloads_attachments(tmp_path):
     list_html = load_fixture("lh_list_page.html")
-    empty_html = """<html><body><table><tbody></tbody></table></body></html>"""
+    empty_html = """<html><body><table><tbody></tbody></table><div class="bbs_pagerA"><strong class="bbs_pge_num" title="현재페이지">2</strong></div></body></html>"""
 
-    list_url = "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancList.do?mi=1026&pageIndex=1"
-    next_url = "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancList.do?mi=1026&pageIndex=2"
+    base_list_url = "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancList.do"
 
-    responses.add(responses.GET, list_url, body=list_html, status=200)
-    responses.add(responses.GET, next_url, body=empty_html, status=200)
-
-    detail_url = "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancDetail.do?panId=2024-001&panDtlSeq=1"
-    responses.add(responses.GET, detail_url, body=load_fixture("lh_detail_page.html"), status=200)
-
+    # Mock GET requests for pagination with query parameter matchers
+    # Session init: no currPage param
     responses.add(
-        responses.POST,
-        "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancDetail.do",
-        body=load_fixture("lh_detail_page.html"),
+        responses.GET,
+        base_list_url,
+        match=[matchers.query_param_matcher({"mi": "1026"})],
+        body=list_html,
+        status=200,
+    )
+    # Page 1: currPage=1
+    responses.add(
+        responses.GET,
+        base_list_url,
+        match=[matchers.query_param_matcher({"mi": "1026", "currPage": "1"})],
+        body=list_html,
+        status=200,
+    )
+    # Page 2: currPage=2
+    responses.add(
+        responses.GET,
+        base_list_url,
+        match=[matchers.query_param_matcher({"mi": "1026", "currPage": "2"})],
+        body=empty_html,
         status=200,
     )
 
+    # Mock detail pages
+    detail_url_1 = "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancDetail.do?panId=2024-001&panDtlSeq=1"
+    responses.add(responses.GET, detail_url_1, body=load_fixture("lh_detail_page.html"), status=200)
+
+    detail_url_2 = "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancInfo.do"
+    responses.add(responses.GET, detail_url_2, body=load_fixture("lh_detail_page.html"), status=200)
+
+    # Mock PDF downloads - use regex matchers for flexible URL matching
     responses.add(
         responses.GET,
-        "https://apply.lh.or.kr/lhapply/lfhFile.do?fileId=abc123",
+        "https://apply.lh.or.kr/lhapply/lhFile.do?fileid=abc123",
+        body=b"%PDF-1.4",
+        status=200,
+        content_type="application/pdf",
+    )
+    responses.add(
+        responses.GET,
+        "https://apply.lh.or.kr/lhapply/lhFile.do?fileid=xyz987",
         body=b"%PDF-1.4",
         status=200,
         content_type="application/pdf",
