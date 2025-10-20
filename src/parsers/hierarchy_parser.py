@@ -52,9 +52,9 @@ class HierarchyParser:
             for page_num, page in enumerate(pdf.pages):
                 text_blocks = self._extract_text_blocks(page, page_num)
 
-                # Filter out excluded regions
+                # IMPORTANT: Filter carefully - preserve headings even in table regions
                 if exclude_regions:
-                    text_blocks = self._filter_excluded_regions(
+                    text_blocks = self._filter_excluded_regions_smart(
                         text_blocks, exclude_regions
                     )
 
@@ -191,9 +191,58 @@ class HierarchyParser:
 
         return filtered
 
+    def _filter_excluded_regions_smart(
+        self, text_blocks: List[TextBlock], exclude_regions: List[BoundingBox]
+    ) -> List[TextBlock]:
+        """
+        Smart filtering that preserves section headings even if they overlap with tables.
+
+        Strategy:
+        1. First identify which blocks are headings
+        2. Always preserve heading blocks
+        3. Filter non-heading blocks that overlap with tables
+
+        Args:
+            text_blocks: List of text blocks
+            exclude_regions: Regions to exclude (e.g., table bboxes)
+
+        Returns:
+            Filtered list of text blocks with headings preserved
+        """
+        filtered = []
+
+        for block in text_blocks:
+            # Check if this is a heading
+            is_heading = self._detect_heading(block) is not None
+
+            if is_heading:
+                # Always keep headings, even if they overlap with tables
+                filtered.append(block)
+                LOGGER.debug(
+                    f"Preserved heading in table region: {block.text[:50]}"
+                )
+            else:
+                # For non-headings, check exclusion
+                is_excluded = False
+                for exclude_bbox in exclude_regions:
+                    if block.bbox.overlaps(exclude_bbox):
+                        is_excluded = True
+                        break
+
+                if not is_excluded:
+                    filtered.append(block)
+
+        return filtered
+
     def _build_hierarchy(self, text_blocks: List[TextBlock]) -> List[Section]:
         """
         Build hierarchical section structure from text blocks.
+
+        Hierarchy levels:
+        - Level 0: Document title (optional, large centered text)
+        - Level 1: Main sections (1., 2., 3., ...)
+        - Level 2: Subsections (■, sub-numbers)
+        - Level 3: Sub-subsections (○, ▪, •, ▶)
 
         Args:
             text_blocks: List of text blocks
@@ -220,7 +269,14 @@ class HierarchyParser:
                 # Create new section
                 new_section = Section(level=level, title=title, bbox=block.bbox)
 
+                # Special handling for level 0 (document title)
+                if level == 0:
+                    # Document title goes to top level but doesn't affect stack
+                    sections.append(new_section)
+                    continue
+
                 # Find parent section based on level
+                # Pop sections with level >= current level
                 while (
                     current_section_stack
                     and current_section_stack[-1].level >= level
@@ -231,7 +287,7 @@ class HierarchyParser:
                     # Add as child to parent
                     current_section_stack[-1].add_child(new_section)
                 else:
-                    # Top-level section
+                    # Top-level section (level 1)
                     sections.append(new_section)
 
                 current_section_stack.append(new_section)
@@ -240,6 +296,10 @@ class HierarchyParser:
                 # Regular content - add to current section
                 if current_section_stack:
                     current_section_stack[-1].content.append(block.text)
+                elif sections:
+                    # If no section stack but we have sections (e.g., after doc title)
+                    # Add to last section
+                    sections[-1].content.append(block.text)
 
         return sections
 
@@ -261,33 +321,51 @@ class HierarchyParser:
         match = re.match(r"^(\d+)\.\s+(.+)$", text)
         if match:
             number = int(match.group(1))
-            title = match.group(2)
-            return (1, text)  # Top-level section
+            title = match.group(2).strip()
+            return (1, f"{number}. {title}")  # Keep full format for consistency
 
         # Check sub-numbered headings (3-1., 3-2., etc.)
         match = re.match(r"^(\d+)-(\d+)\.\s+(.+)$", text)
         if match:
-            title = match.group(3)
-            return (2, text)  # Second-level section
+            title = match.group(3).strip()
+            prefix = f"{match.group(1)}-{match.group(2)}"
+            return (2, f"{prefix}. {title}")  # Second-level section
 
         # Check Korean letter headings (가., 나., etc.)
         match = re.match(r"^([가-힣])\.\s+(.+)$", text)
         if match:
-            title = match.group(2)
-            return (3, text)  # Third-level section
+            letter = match.group(1)
+            title = match.group(2).strip()
+            return (3, f"{letter}. {title}")  # Third-level section
 
-        # Check bullet points
+        # Check bullet points - multiple types
+        # ■ (Black square) - Level 2
         if text.startswith("■ "):
-            return (2, text[2:].strip())
+            return (2, text.strip())
 
+        # ▪ (Small black square) - Level 3
+        if text.startswith("▪ ") or text.startswith("▪"):
+            return (3, text.strip())
+
+        # ○ (White circle) - Level 3
+        if text.startswith("○ "):
+            return (3, text.strip())
+
+        # • (Bullet point) - Level 3
+        if text.startswith("• "):
+            return (3, text.strip())
+
+        # ▶ (Triangle) - Level 3
         if text.startswith("▶ "):
-            return (3, text[2:].strip())
+            return (3, text.strip())
 
-        # Check by formatting (bold, large font)
-        if block.is_bold or (
-            block.font_size and block.font_size > 12
-        ):
-            # Detect level by indentation
+        # Check by formatting (bold, large font) for potential main title
+        # Large centered text could be document title (level 0)
+        if block.font_size and block.font_size > 14:
+            # Very large font - likely document title
+            return (0, text)
+        elif block.is_bold or (block.font_size and block.font_size > 12):
+            # Moderately large/bold - detect level by indentation
             level = self._detect_indentation_level(block)
             if level > 0:
                 return (level, text)
