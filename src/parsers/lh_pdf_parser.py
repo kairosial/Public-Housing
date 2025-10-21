@@ -336,11 +336,34 @@ class LHPDFParser(PDFParser):
         """
         import pandas as pd
 
+        # Reset both row and column indices to avoid conflicts
+        df1 = table1.dataframe.copy()
+        df2 = table2.dataframe.copy()
+
+        # Reset row index
+        df1 = df1.reset_index(drop=True)
+        df2 = df2.reset_index(drop=True)
+
+        # Ensure column names are unique by resetting them if needed
+        if df1.columns.duplicated().any():
+            df1.columns = range(len(df1.columns))
+        if df2.columns.duplicated().any():
+            df2.columns = range(len(df2.columns))
+
         # Concatenate dataframes
-        merged_df = pd.concat(
-            [table1.dataframe, table2.dataframe],
-            ignore_index=True
-        )
+        try:
+            merged_df = pd.concat(
+                [df1, df2],
+                axis=0,
+                ignore_index=True,
+                sort=False
+            )
+        except Exception as e:
+            LOGGER.warning(
+                f"Failed to merge tables with error: {e}. "
+                f"Using first table only."
+            )
+            merged_df = df1
 
         # Update bounding box to cover both tables
         if table1.bbox and table2.bbox:

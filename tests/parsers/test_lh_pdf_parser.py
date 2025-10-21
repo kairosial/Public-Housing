@@ -111,7 +111,7 @@ class TestLHPDFParser:
         assert len(document.sections) == 1
         assert document.sections[0].title == "1. Test Section"
         assert document.metadata["total_sections"] == 1
-        assert document.metadata["source"] == str(sample_pdf_path)
+        assert document.source_path == sample_pdf_path
 
     def test_merge_tables_into_sections(self, parser: LHPDFParser) -> None:
         """Test merging tables into sections."""
@@ -242,6 +242,7 @@ class TestLHPDFParser:
         table2 = TableData(
             dataframe=pd.DataFrame({"col1": ["c"]}),
             bbox=BoundingBox(x0=100, y0=50, x1=400, y1=150, page=2),
+            page=2,
             metadata={},
         )
 
