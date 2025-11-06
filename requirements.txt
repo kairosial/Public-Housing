@@ -1,4 +1,0 @@
-beautifulsoup4>=4.12
-requests>=2.31
-responses>=0.25
-pytest>=7.4
