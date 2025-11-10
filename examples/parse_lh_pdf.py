@@ -77,9 +77,9 @@ def save_results(document, pdf_path: Path) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Create subdirectory for this PDF
-    pdf_name = pdf_path.stem
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_subdir = OUTPUT_DIR / f"{pdf_name}_{timestamp}"
+    parent_dir_name = pdf_path.parent.name
+    timestamp = datetime.now().strftime("%y%m%d_%H%M")
+    output_subdir = OUTPUT_DIR / f"{timestamp}-{parent_dir_name}"
     output_subdir.mkdir(parents=True, exist_ok=True)
 
     # 1. Save JSON (full structure)
