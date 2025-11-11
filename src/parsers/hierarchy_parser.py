@@ -195,12 +195,13 @@ class HierarchyParser:
         self, text_blocks: List[TextBlock], exclude_regions: List[BoundingBox]
     ) -> List[TextBlock]:
         """
-        Smart filtering that preserves section headings even if they overlap with tables.
+        Smart filtering that preserves section headings but excludes table content.
 
         Strategy:
-        1. First identify which blocks are headings
-        2. Always preserve heading blocks
-        3. Filter non-heading blocks that overlap with tables
+        1. Identify which blocks are headings
+        2. Always preserve heading blocks (even if in table regions)
+        3. For non-headings, calculate overlap ratio with table regions
+        4. Exclude content if overlap > 50% (likely table data)
 
         Args:
             text_blocks: List of text blocks
@@ -219,20 +220,62 @@ class HierarchyParser:
                 # Always keep headings, even if they overlap with tables
                 filtered.append(block)
                 LOGGER.debug(
-                    f"Preserved heading in table region: {block.text[:50]}"
+                    f"Preserved heading: {block.text[:50]}"
                 )
             else:
-                # For non-headings, check exclusion
-                is_excluded = False
-                for exclude_bbox in exclude_regions:
-                    if block.bbox.overlaps(exclude_bbox):
-                        is_excluded = True
-                        break
+                # For non-headings, check overlap with table regions
+                overlap_ratio = self._calculate_max_overlap_ratio(
+                    block.bbox, exclude_regions
+                )
 
-                if not is_excluded:
+                # Strict exclusion: if >50% overlap with table, exclude it
+                if overlap_ratio < 0.5:
                     filtered.append(block)
+                else:
+                    LOGGER.debug(
+                        f"Excluded content in table region (overlap={overlap_ratio:.1%}): "
+                        f"{block.text[:50]}"
+                    )
 
         return filtered
+
+    def _calculate_max_overlap_ratio(
+        self, bbox: BoundingBox, exclude_regions: List[BoundingBox]
+    ) -> float:
+        """
+        Calculate the maximum overlap ratio between a bbox and exclude regions.
+
+        Args:
+            bbox: Bounding box to check
+            exclude_regions: List of regions to check against
+
+        Returns:
+            Maximum overlap ratio (0.0 to 1.0)
+        """
+        max_ratio = 0.0
+        bbox_area = bbox.width * bbox.height
+
+        if bbox_area == 0:
+            return 0.0
+
+        for exclude_bbox in exclude_regions:
+            if not bbox.overlaps(exclude_bbox):
+                continue
+
+            # Calculate overlap area
+            x_overlap = max(
+                0, min(bbox.x1, exclude_bbox.x1) - max(bbox.x0, exclude_bbox.x0)
+            )
+            y_overlap = max(
+                0, min(bbox.y1, exclude_bbox.y1) - max(bbox.y0, exclude_bbox.y0)
+            )
+            overlap_area = x_overlap * y_overlap
+
+            # Calculate overlap ratio
+            overlap_ratio = overlap_area / bbox_area
+            max_ratio = max(max_ratio, overlap_ratio)
+
+        return max_ratio
 
     def _build_hierarchy(self, text_blocks: List[TextBlock]) -> List[Section]:
         """
@@ -260,6 +303,18 @@ class HierarchyParser:
         current_section_stack: List[Section] = []
 
         for block in text_blocks:
+            # First check if this is a subtitle (parenthesized text after Level 0 title)
+            if self._detect_subtitle(block, sections):
+                # Create subtitle as Level 1 child of the last Level 0 title
+                subtitle_section = Section(
+                    level=1,
+                    title=block.text.strip(),
+                    bbox=block.bbox
+                )
+                sections[-1].add_child(subtitle_section)
+                LOGGER.debug(f"Detected subtitle: {block.text.strip()}")
+                continue
+
             # Detect if this block is a heading
             heading_info = self._detect_heading(block)
 
@@ -301,13 +356,111 @@ class HierarchyParser:
                     # Add to last section
                     sections[-1].content.append(block.text)
 
+        # Post-process: merge bullet point paragraphs
+        self._consolidate_bullet_paragraphs(sections)
+
         return sections
+
+    def _consolidate_bullet_paragraphs(self, sections: List[Section]) -> None:
+        """
+        Consolidate multi-line bullet point paragraphs into single content entries.
+
+        Bullet paragraphs (starting with •) are often split across multiple lines.
+        This method merges them back together for better readability.
+
+        Args:
+            sections: List of sections to process (modified in-place)
+        """
+        for section in sections:
+            if section.content:
+                section.content = self._merge_bullet_lines(section.content)
+
+            # Recursively process children
+            if section.children:
+                self._consolidate_bullet_paragraphs(section.children)
+
+    def _merge_bullet_lines(self, content_lines: List[str]) -> List[str]:
+        """
+        Merge consecutive lines that belong to the same bullet paragraph.
+
+        Args:
+            content_lines: List of content lines
+
+        Returns:
+            Merged content lines
+        """
+        if not content_lines:
+            return content_lines
+
+        merged = []
+        current_paragraph = []
+
+        for line in content_lines:
+            stripped = line.strip()
+
+            # Check if this is a bullet point start
+            if stripped.startswith("• "):
+                # Save previous paragraph if exists
+                if current_paragraph:
+                    merged.append(" ".join(current_paragraph))
+                    current_paragraph = []
+
+                # Start new paragraph
+                current_paragraph.append(stripped)
+
+            elif current_paragraph:
+                # This is a continuation of the current bullet paragraph
+                # (doesn't start with • but we have an active paragraph)
+                current_paragraph.append(stripped)
+
+            else:
+                # Regular content (not part of bullet paragraph)
+                merged.append(line)
+
+        # Don't forget the last paragraph
+        if current_paragraph:
+            merged.append(" ".join(current_paragraph))
+
+        return merged
+
+    def _detect_subtitle(self, block: TextBlock, previous_sections: List[Section]) -> bool:
+        """
+        Detect if a block is a subtitle (should be child of previous Level 0 title).
+
+        Subtitles are typically:
+        - Parenthesized text: (입주자모집공고일 : 2025.09.29)
+        - Appear immediately after a Level 0 document title
+        - Have medium-large font but not as large as main title
+
+        Args:
+            block: Text block to check
+            previous_sections: List of previously parsed sections
+
+        Returns:
+            True if this is a subtitle that should be attached to previous title
+        """
+        text = block.text.strip()
+
+        # Pattern 1: Parenthesized date/metadata
+        if re.match(r"^\([^)]{5,80}\)$", text):
+            # Check if previous section was a Level 0 title
+            if previous_sections and previous_sections[-1].level == 0:
+                # Check if there are no children yet (subtitle should be first child)
+                if len(previous_sections[-1].children) == 0:
+                    return True
+
+        return False
 
     def _detect_heading(
         self, block: TextBlock
     ) -> Optional[Tuple[int, str]]:
         """
         Detect if text block is a heading and determine its level.
+
+        Strategy:
+        1. Check indentation and font size FIRST
+        2. Then apply pattern matching
+        3. For numbered patterns with indentation/small font, use indentation-based level
 
         Args:
             block: Text block to check
@@ -317,12 +470,31 @@ class HierarchyParser:
         """
         text = block.text.strip()
 
+        # Calculate indentation level for this block
+        indent_level = self._detect_indentation_level(block)
+        is_small_font = block.font_size and block.font_size < 10
+        is_indented = indent_level > 1  # Level 2+ means indented
+
         # Check numbered headings (1., 2., etc.)
         match = re.match(r"^(\d+)\.\s+(.+)$", text)
         if match:
             number = int(match.group(1))
             title = match.group(2).strip()
-            return (1, f"{number}. {title}")  # Keep full format for consistency
+
+            # INDENTATION-FIRST LOGIC:
+            # If small font OR indented, use indentation level instead of default Level 1
+            if is_small_font or is_indented:
+                # Use indentation level (but ensure it's at least 3 for sub-items)
+                detected_level = max(3, indent_level)
+                LOGGER.debug(
+                    f"Numbered item '{number}. {title[:30]}...' detected with "
+                    f"indent_level={indent_level}, font_size={block.font_size}, "
+                    f"assigned level={detected_level}"
+                )
+                return (detected_level, f"{number}. {title}")
+            else:
+                # Large font + no indentation = main section (Level 1)
+                return (1, f"{number}. {title}")
 
         # Check sub-numbered headings (3-1., 3-2., etc.)
         match = re.match(r"^(\d+)-(\d+)\.\s+(.+)$", text)
@@ -351,9 +523,8 @@ class HierarchyParser:
         if text.startswith("○ "):
             return (3, text.strip())
 
-        # • (Bullet point) - Level 3
-        if text.startswith("• "):
-            return (3, text.strip())
+        # NOTE: • (Bullet point) is NO LONGER treated as heading
+        # It will be parsed as regular content to keep paragraphs together
 
         # ▶ (Triangle) - Level 3
         if text.startswith("▶ "):

@@ -18,7 +18,8 @@ class TableExtractor:
 
     def __init__(self) -> None:
         """Initialize table extractor."""
-        self.min_accuracy = 50  # Minimum table accuracy threshold
+        self.min_accuracy = 50  # Minimum table accuracy threshold (for initial filter)
+        self.min_quality_score = 0.5  # Minimum comprehensive quality score (0-1)
 
     def extract_tables(
         self,
@@ -109,6 +110,19 @@ class TableExtractor:
                     continue
 
                 table_data = self._convert_to_table_data(table, idx, flavor)
+
+                # Calculate comprehensive quality score
+                quality_score = self._calculate_table_quality_score(table_data, table)
+                table_data.metadata["quality_score"] = quality_score
+
+                # Skip low-quality tables (likely text boxes misdetected as tables)
+                if quality_score < self.min_quality_score:
+                    LOGGER.debug(
+                        f"Skipping low-quality table (quality: {quality_score:.2f}, "
+                        f"accuracy: {table.accuracy:.1f}%, shape: {table_data.dataframe.shape})"
+                    )
+                    continue
+
                 tables.append(table_data)
 
         except Exception as exc:
@@ -189,6 +203,79 @@ class TableExtractor:
         # Headers typically have text in most cells
         non_empty_ratio = row.notna().sum() / len(row)
         return non_empty_ratio > 0.5
+
+    def _calculate_table_quality_score(
+        self, table_data: TableData, camelot_table
+    ) -> float:
+        """
+        Calculate comprehensive quality score for a table.
+
+        This helps distinguish real tables from text boxes or misdetected regions.
+
+        Scoring factors:
+        - Accuracy (40%): Camelot's built-in accuracy metric
+        - Structure (30%): Proper table dimensions (at least 2x2)
+        - Content diversity (20%): Cells should have different values
+        - Numeric content (10%): Tables often contain numbers
+
+        Args:
+            table_data: Converted TableData object
+            camelot_table: Original Camelot table object
+
+        Returns:
+            Quality score between 0 and 1
+        """
+        score = 0.0
+        df = table_data.dataframe
+
+        # Factor 1: Accuracy (40%)
+        # Camelot accuracy ranges from 0-100
+        accuracy_score = (camelot_table.accuracy / 100) * 0.4
+        score += accuracy_score
+
+        # Factor 2: Structure (30%)
+        # Real tables should have at least 2 rows and 2 columns
+        rows, cols = df.shape
+        if rows >= 2 and cols >= 2:
+            # Award full points for minimum structure
+            structure_score = 0.3
+            # Bonus for larger tables (up to 5x5)
+            size_bonus = min(rows * cols / 25, 1.0) * 0.05
+            score += structure_score + size_bonus
+        elif rows >= 1 and cols >= 1:
+            # Partial credit for 1xN or Nx1 tables
+            score += 0.1
+
+        # Factor 3: Content diversity (20%)
+        # Text boxes often have repeated values or single long text
+        total_cells = rows * cols
+        if total_cells > 0:
+            unique_values = df.stack().nunique()
+            diversity_ratio = unique_values / total_cells
+            # High diversity = likely a real table
+            diversity_score = min(diversity_ratio, 1.0) * 0.2
+            score += diversity_score
+
+        # Factor 4: Numeric content (10%)
+        # Tables often contain numbers (vs pure text in text boxes)
+        numeric_cells = 0
+        for col in df.columns:
+            numeric_cells += df[col].apply(
+                lambda x: bool(pd.to_numeric(x, errors='coerce') is not pd.NA)
+            ).sum()
+
+        if total_cells > 0:
+            numeric_ratio = numeric_cells / total_cells
+            numeric_score = numeric_ratio * 0.1
+            score += numeric_score
+
+        LOGGER.debug(
+            f"Table quality: {score:.2f} "
+            f"(accuracy={accuracy_score:.2f}, structure={rows}x{cols}, "
+            f"diversity={unique_values}/{total_cells}, numeric={numeric_cells}/{total_cells})"
+        )
+
+        return score
 
     def _overlaps_with_existing(
         self, table: TableData, existing_tables: List[TableData]
