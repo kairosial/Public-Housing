@@ -195,16 +195,24 @@ class LHPDFParser(PDFParser):
 
             # Calculate matching score
             score = 0
+            score_breakdown = {}
 
             # Same page bonus
             if section.bbox.page == table.bbox.page:
                 score += 100
+                score_breakdown["same_page"] = 100
+            else:
+                score_breakdown["same_page"] = 0
 
             # Overlap bonus
             if section.bbox.overlaps(table.bbox):
                 score += 50
+                score_breakdown["overlap"] = 50
+            else:
+                score_breakdown["overlap"] = 0
 
             # Proximity bonus (vertical distance)
+            proximity_score = 0
             if section.bbox.page == table.bbox.page:
                 # Table below section heading
                 if table.bbox.y0 >= section.bbox.y1:
@@ -212,9 +220,23 @@ class LHPDFParser(PDFParser):
                     # Closer is better (max 50 points)
                     proximity_score = max(0, 50 - vertical_distance / 10)
                     score += proximity_score
+            score_breakdown["proximity"] = proximity_score
 
             # Depth bonus (prefer more specific sections)
-            score += depth * 10
+            depth_score = depth * 10
+            score += depth_score
+            score_breakdown["depth"] = depth_score
+
+            # Log scoring details
+            LOGGER.debug(
+                f"Scoring section '{section.title}' (L{section.level}) "
+                f"for table on page {table.bbox.page}: "
+                f"total={score:.1f} "
+                f"(page={score_breakdown['same_page']}, "
+                f"overlap={score_breakdown['overlap']}, "
+                f"prox={score_breakdown['proximity']:.1f}, "
+                f"depth={score_breakdown['depth']})"
+            )
 
             if score > best_score:
                 best_score = score
@@ -227,6 +249,18 @@ class LHPDFParser(PDFParser):
         # Score all sections
         for section in sections:
             score_section(section)
+
+        if best_section:
+            LOGGER.debug(
+                f"Best match for table on page {table.bbox.page}: "
+                f"'{best_section.title}' (L{best_section.level}) "
+                f"with score {best_score:.1f}"
+            )
+        else:
+            LOGGER.warning(
+                f"No section found for table on page {table.bbox.page} "
+                f"at position ({table.bbox.x0:.1f}, {table.bbox.y0:.1f})"
+            )
 
         return best_section
 
