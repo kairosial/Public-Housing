@@ -7,6 +7,9 @@ from datetime import datetime
 from pathlib import Path
 
 from src.parsers import LHPDFParser
+from src.parsers.hierarchy_parser import HierarchyParser
+from src.parsers.layout_analyzer import LayoutAnalyzer
+from src.parsers.table_extractor import TableExtractor
 
 # Configure logging
 logging.basicConfig(
@@ -207,23 +210,386 @@ def print_section(section, indent: int = 0) -> None:
         print_section(child, indent + 1)
 
 
+def debug_parse_lh_announcement(
+    pdf_path: Path, save_output: bool = True, interactive: bool = True
+) -> None:
+    """
+    Parse LH announcement in debug mode with step-by-step execution.
+
+    Args:
+        pdf_path: Path to LH PDF file
+        save_output: Whether to save output to files (default: True)
+        interactive: Whether to pause between steps (default: True)
+    """
+    print("\n" + "=" * 80)
+    print("DEBUG MODE: Step-by-Step PDF Parsing")
+    print("=" * 80)
+    print(f"\nPDF: {pdf_path}")
+    print(f"File size: {pdf_path.stat().st_size / 1024:.1f} KB\n")
+
+    # Enable DEBUG logging for parsers
+    logging.getLogger("src.parsers").setLevel(logging.DEBUG)
+
+    # Create output directory for debug files
+    timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
+    parent_dir_name = pdf_path.parent.name
+    debug_dir = OUTPUT_DIR / "debug" / f"{timestamp}-{parent_dir_name}"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Debug output directory: {debug_dir}\n")
+
+    # =========================================================================
+    # STEP 1: Layout Analysis
+    # =========================================================================
+    print("=" * 80)
+    print("STEP 1: Layout Analysis (PyMuPDF)")
+    print("=" * 80)
+
+    layout_analyzer = LayoutAnalyzer()
+    layout_info = layout_analyzer.analyze(pdf_path)
+
+    # Statistics
+    total_text_blocks = sum(len(page["text_blocks"]) for page in layout_info.values())
+    total_table_regions = sum(
+        len(page["table_regions"]) for page in layout_info.values()
+    )
+
+    print(f"\nResults:")
+    print(f"  Pages analyzed: {len(layout_info)}")
+    print(f"  Total text blocks: {total_text_blocks}")
+    print(f"  Detected table regions: {total_table_regions}")
+
+    # Per-page breakdown
+    print(f"\n  Per-page breakdown:")
+    for page_num, page_data in sorted(layout_info.items()):
+        print(
+            f"    Page {page_num}: {len(page_data['text_blocks'])} blocks, "
+            f"{len(page_data['table_regions'])} table regions"
+        )
+
+    # Save layout info
+    if save_output:
+        layout_file = debug_dir / "01_layout_info.json"
+        layout_json = {}
+        for page_num, page_data in layout_info.items():
+            layout_json[str(page_num)] = {
+                "page_num": page_data["page_num"],
+                "page_size": page_data["page_size"],
+                "text_blocks": [
+                    {
+                        "text": block.text,
+                        "bbox": [block.bbox.x0, block.bbox.y0, block.bbox.x1, block.bbox.y1],
+                        "font_size": block.font_size,
+                        "font_name": block.font_name,
+                        "is_bold": block.is_bold,
+                        "is_italic": block.is_italic,
+                    }
+                    for block in page_data["text_blocks"]
+                ],
+                "table_regions": [
+                    {
+                        "bbox": [r.x0, r.y0, r.x1, r.y1],
+                        "page": r.page,
+                    }
+                    for r in page_data["table_regions"]
+                ],
+            }
+        with open(layout_file, "w", encoding="utf-8") as f:
+            json.dump(layout_json, f, ensure_ascii=False, indent=2)
+        print(f"\n  Saved: {layout_file}")
+
+    if interactive:
+        input("\nPress Enter to continue to Step 2...")
+    else:
+        print("\n→ Moving to Step 2...")
+
+    # =========================================================================
+    # STEP 2: Table Extraction
+    # =========================================================================
+    print("\n" + "=" * 80)
+    print("STEP 2: Table Extraction (Camelot)")
+    print("=" * 80)
+
+    table_extractor = TableExtractor()
+
+    # Extract with both flavors
+    print("\n  Extracting with lattice mode...")
+    lattice_tables = table_extractor.extract_tables(pdf_path, flavor="lattice")
+
+    print(f"  Extracting with stream mode...")
+    stream_tables = table_extractor.extract_tables(pdf_path, flavor="stream")
+
+    all_tables = table_extractor.extract_tables(pdf_path, flavor="both")
+
+    print(f"\nResults:")
+    print(f"  Lattice tables: {len(lattice_tables)}")
+    print(f"  Stream tables: {len(stream_tables)}")
+    print(f"  Total after deduplication: {len(all_tables)}")
+
+    # Table quality breakdown
+    if all_tables:
+        print(f"\n  Table quality metrics:")
+        for i, table in enumerate(all_tables, 1):
+            print(
+                f"    Table {i} (page {table.page}): "
+                f"accuracy={table.metadata.get('accuracy', 0):.1f}%, "
+                f"quality={table.metadata.get('quality_score', 0):.2f}, "
+                f"shape={table.dataframe.shape}, "
+                f"flavor={table.metadata.get('flavor', 'unknown')}"
+            )
+
+    # Save tables
+    if save_output and all_tables:
+        tables_file = debug_dir / "02_tables.json"
+        tables_json = []
+        for i, table in enumerate(all_tables):
+            tables_json.append({
+                "index": i,
+                "page": table.page,
+                "bbox": [table.bbox.x0, table.bbox.y0, table.bbox.x1, table.bbox.y1]
+                if table.bbox
+                else None,
+                "shape": list(table.dataframe.shape),
+                "metadata": table.metadata,
+                "caption": table.caption,
+                "dataframe": table.dataframe.to_dict(orient="records"),
+            })
+        with open(tables_file, "w", encoding="utf-8") as f:
+            json.dump(tables_json, f, ensure_ascii=False, indent=2)
+        print(f"\n  Saved: {tables_file}")
+
+        # Also save as CSV
+        tables_csv_dir = debug_dir / "tables_csv"
+        tables_csv_dir.mkdir(exist_ok=True)
+        for i, table in enumerate(all_tables, 1):
+            csv_file = tables_csv_dir / f"table_{i:03d}_page_{table.page}.csv"
+            table.dataframe.to_csv(csv_file, index=False, encoding="utf-8-sig")
+
+    if interactive:
+        input("\nPress Enter to continue to Step 3...")
+    else:
+        print("\n→ Moving to Step 3...")
+
+    # =========================================================================
+    # STEP 3: Hierarchical Text Parsing
+    # =========================================================================
+    print("\n" + "=" * 80)
+    print("STEP 3: Hierarchical Text Parsing (pdfplumber)")
+    print("=" * 80)
+
+    hierarchy_parser = HierarchyParser()
+
+    # Get table bboxes for exclusion
+    table_bboxes = [table.bbox for table in all_tables if table.bbox]
+    print(f"\n  Excluding {len(table_bboxes)} table regions from text extraction")
+
+    sections = hierarchy_parser.parse(pdf_path, exclude_regions=table_bboxes)
+
+    print(f"\nResults:")
+    print(f"  Top-level sections: {len(sections)}")
+
+    # Count all sections recursively
+    def count_sections(section_list):
+        count = len(section_list)
+        for section in section_list:
+            count += count_sections(section.children)
+        return count
+
+    total_sections = count_sections(sections)
+    print(f"  Total sections (all levels): {total_sections}")
+
+    # Level distribution
+    level_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
+
+    def count_levels(section_list):
+        for section in section_list:
+            level_counts[section.level] += 1
+            count_levels(section.children)
+
+    count_levels(sections)
+
+    print(f"\n  Section level distribution:")
+    for level in range(5):
+        print(f"    Level {level}: {level_counts[level]} sections")
+
+    print(f"\n  Hierarchical structure preview:")
+    for section in sections[:3]:  # Show first 3 top-level sections
+        print_section(section, indent=1)
+        if len(sections) > 3:
+            print("  ...")
+
+    # Save sections
+    if save_output:
+        sections_file = debug_dir / "03_sections.json"
+
+        def section_to_dict(section):
+            return {
+                "level": section.level,
+                "title": section.title,
+                "bbox": [
+                    section.bbox.x0,
+                    section.bbox.y0,
+                    section.bbox.x1,
+                    section.bbox.y1,
+                    section.bbox.page,
+                ]
+                if section.bbox
+                else None,
+                "content": section.content,
+                "table_count": len(section.tables),
+                "children": [section_to_dict(child) for child in section.children],
+            }
+
+        sections_json = [section_to_dict(s) for s in sections]
+        with open(sections_file, "w", encoding="utf-8") as f:
+            json.dump(sections_json, f, ensure_ascii=False, indent=2)
+        print(f"\n  Saved: {sections_file}")
+
+    if interactive:
+        input("\nPress Enter to continue to Step 4...")
+    else:
+        print("\n→ Moving to Step 4...")
+
+    # =========================================================================
+    # STEP 4: Merge Tables into Sections
+    # =========================================================================
+    print("\n" + "=" * 80)
+    print("STEP 4: Merge Tables into Sections")
+    print("=" * 80)
+
+    # Use LHPDFParser's private method
+    parser = LHPDFParser()
+    parser._merge_tables_into_sections(sections, all_tables)
+
+    # Count assigned tables
+    def count_tables(section_list):
+        count = 0
+        for section in section_list:
+            count += len(section.tables)
+            count += count_tables(section.children)
+        return count
+
+    assigned_tables = count_tables(sections)
+
+    print(f"\nResults:")
+    print(f"  Tables assigned to sections: {assigned_tables} / {len(all_tables)}")
+
+    if assigned_tables < len(all_tables):
+        print(
+            f"  WARNING: {len(all_tables) - assigned_tables} tables "
+            "were not assigned to any section!"
+        )
+
+    # Show which sections got tables
+    print(f"\n  Sections with tables:")
+
+    def print_sections_with_tables(section_list, indent=1):
+        for section in section_list:
+            if section.tables:
+                prefix = "  " * indent
+                print(
+                    f"{prefix}[L{section.level}] {section.title}: "
+                    f"{len(section.tables)} table(s)"
+                )
+            print_sections_with_tables(section.children, indent + 1)
+
+    print_sections_with_tables(sections)
+
+    # Save merged result
+    if save_output:
+        merged_file = debug_dir / "04_sections_with_tables.json"
+
+        def section_to_dict_full(section):
+            return {
+                "level": section.level,
+                "title": section.title,
+                "bbox": [
+                    section.bbox.x0,
+                    section.bbox.y0,
+                    section.bbox.x1,
+                    section.bbox.y1,
+                    section.bbox.page,
+                ]
+                if section.bbox
+                else None,
+                "content": section.content,
+                "tables": [
+                    {
+                        "page": t.page,
+                        "shape": list(t.dataframe.shape),
+                        "accuracy": t.metadata.get("accuracy"),
+                        "quality_score": t.metadata.get("quality_score"),
+                    }
+                    for t in section.tables
+                ],
+                "children": [section_to_dict_full(child) for child in section.children],
+            }
+
+        merged_json = [section_to_dict_full(s) for s in sections]
+        with open(merged_file, "w", encoding="utf-8") as f:
+            json.dump(merged_json, f, ensure_ascii=False, indent=2)
+        print(f"\n  Saved: {merged_file}")
+
+    print("\n" + "=" * 80)
+    print("DEBUG PARSING COMPLETE")
+    print("=" * 80)
+    print(f"\nAll debug files saved to: {debug_dir}")
+    print(
+        "\nNext steps:\n"
+        "  1. Review layout_info.json to check table region detection\n"
+        "  2. Review tables.json to check extraction quality\n"
+        "  3. Review sections.json to check hierarchy parsing\n"
+        "  4. Review sections_with_tables.json to check table assignment\n"
+    )
+
+
 def main() -> None:
     """Main entry point."""
-    import sys
+    import argparse
 
-    if len(sys.argv) < 2:
-        print("Usage: python examples/parse_lh_pdf.py <path_to_pdf>")
-        print("\nExample:")
-        print("  python examples/parse_lh_pdf.py data/pdfs/example.pdf")
+    parser = argparse.ArgumentParser(
+        description="Parse LH announcement PDFs",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python examples/parse_lh_pdf.py data/pdfs/example.pdf
+  python examples/parse_lh_pdf.py data/pdfs/example.pdf --debug
+  python examples/parse_lh_pdf.py data/pdfs/example.pdf --no-save
+        """,
+    )
+    parser.add_argument("pdf_path", type=Path, help="Path to PDF file")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode with step-by-step execution",
+    )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Don't save output files",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Run without pausing between steps (for automated testing)",
+    )
+
+    args = parser.parse_args()
+
+    if not args.pdf_path.exists():
+        print(f"Error: File not found: {args.pdf_path}")
+        import sys
+
         sys.exit(1)
 
-    pdf_path = Path(sys.argv[1])
-
-    if not pdf_path.exists():
-        print(f"Error: File not found: {pdf_path}")
-        sys.exit(1)
-
-    parse_lh_announcement(pdf_path)
+    if args.debug:
+        debug_parse_lh_announcement(
+            args.pdf_path,
+            save_output=not args.no_save,
+            interactive=not args.non_interactive,
+        )
+    else:
+        parse_lh_announcement(args.pdf_path, save_output=not args.no_save)
 
 
 if __name__ == "__main__":

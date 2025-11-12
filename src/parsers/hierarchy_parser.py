@@ -469,6 +469,10 @@ class HierarchyParser:
             Tuple of (level, title) if heading, None otherwise
         """
         text = block.text.strip()
+        LOGGER.debug(
+            f"Checking heading for text '{text[:50]}...' "
+            f"(font_size={block.font_size}, x0={block.bbox.x0:.1f})"
+        )
 
         # Calculate indentation level for this block
         indent_level = self._detect_indentation_level(block)
@@ -534,11 +538,20 @@ class HierarchyParser:
         # Large centered text could be document title (level 0)
         if block.font_size and block.font_size > 14:
             # Very large font - likely document title
+            LOGGER.debug(
+                f"Detected Level 0 title by font size: '{text[:50]}...' "
+                f"(font_size={block.font_size})"
+            )
             return (0, text)
         elif block.is_bold or (block.font_size and block.font_size > 12):
             # Moderately large/bold - detect level by indentation
             level = self._detect_indentation_level(block)
             if level > 0:
+                LOGGER.debug(
+                    f"Detected heading by formatting: '{text[:50]}...' "
+                    f"(level={level}, bold={block.is_bold}, "
+                    f"font_size={block.font_size})"
+                )
                 return (level, text)
 
         return None
